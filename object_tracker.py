@@ -2,6 +2,7 @@ import os
 # comment out below line to enable tensorflow logging outputs
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import time
+import copy
 import tensorflow as tf
 physical_devices = tf.config.experimental.list_physical_devices('GPU')
 if len(physical_devices) > 0:
@@ -10,6 +11,7 @@ from absl import app, flags, logging
 from absl.flags import FLAGS
 import core.utils as utils
 from core.yolov4 import filter_boxes
+from core.functions import *
 from tensorflow.python.saved_model import tag_constants
 from core.config import cfg
 from PIL import Image
@@ -35,14 +37,29 @@ flags.DEFINE_string('output_format', 'XVID', 'codec used in VideoWriter when sav
 flags.DEFINE_float('iou', 0.45, 'iou threshold')
 flags.DEFINE_float('score', 0.50, 'score threshold')
 flags.DEFINE_boolean('dont_show', False, 'dont show video output')
-flags.DEFINE_boolean('info', False, 'show detailed info of tracked objects')
-flags.DEFINE_boolean('count', False, 'count objects being tracked on screen')
+flags.DEFINE_boolean('info', True, 'show detailed info of tracked objects')
+flags.DEFINE_boolean('count', True, 'count objects being tracked on screen')
+
+movement_threshold = 1
+
+def is_moving(bbox, previus_bbox):
+    return (
+            abs(int(bbox[0]) - int(previus_bbox[0])) > movement_threshold
+            or abs(int(bbox[1]) - int(previus_bbox[1])) > movement_threshold
+            or abs(int(bbox[2]) - int(previus_bbox[2])) > movement_threshold
+            or abs(int(bbox[3]) - int(previus_bbox[3])) > movement_threshold
+        )
+
+def get_previous_track(previous_tracker, track_id):
+    for track in previous_tracker.tracks:
+        if track.track_id == track_id: return track
+    return None
 
 def main(_argv):
     # Definition of the parameters
     max_cosine_distance = 0.4
     nn_budget = None
-    nms_max_overlap = 1.0
+    nms_max_overlap = 1.0        
     
     # initialize deep sort
     model_filename = 'model_data/mars-small128.pb'
@@ -91,6 +108,134 @@ def main(_argv):
         out = cv2.VideoWriter(FLAGS.output, codec, fps, (width, height))
 
     frame_num = 0
+
+    ### Gwt the first frame tracker
+
+    return_value, frame = vid.read()
+    if return_value:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(frame)
+    else:
+        print('Video has ended or failed, try a different video format!')
+        exit()        
+    frame_num +=1
+    print('Frame #: ', frame_num)
+    frame_size = frame.shape[:2]
+    image_data = cv2.resize(frame, (input_size, input_size))
+    image_data = image_data / 255.
+    image_data = image_data[np.newaxis, ...].astype(np.float32)
+    start_time = time.time()
+
+    # run detections on tflite if flag is set
+    if FLAGS.framework == 'tflite':
+        interpreter.set_tensor(input_details[0]['index'], image_data)
+        interpreter.invoke()
+        pred = [interpreter.get_tensor(output_details[i]['index']) for i in range(len(output_details))]
+        # run detections using yolov3 if flag is set
+        if FLAGS.model == 'yolov3' and FLAGS.tiny == True:
+            boxes, pred_conf = filter_boxes(pred[1], pred[0], score_threshold=0.25,
+                                            input_shape=tf.constant([input_size, input_size]))
+        else:
+            boxes, pred_conf = filter_boxes(pred[0], pred[1], score_threshold=0.25,
+                                            input_shape=tf.constant([input_size, input_size]))
+    else:
+        batch_data = tf.constant(image_data)
+        pred_bbox = infer(batch_data)
+        for key, value in pred_bbox.items():
+            boxes = value[:, :, 0:4]
+            pred_conf = value[:, :, 4:]
+
+    boxes, scores, classes, valid_detections = tf.image.combined_non_max_suppression(
+        boxes=tf.reshape(boxes, (tf.shape(boxes)[0], -1, 1, 4)),
+        scores=tf.reshape(
+            pred_conf, (tf.shape(pred_conf)[0], -1, tf.shape(pred_conf)[-1])),
+        max_output_size_per_class=50,
+        max_total_size=50,
+        iou_threshold=FLAGS.iou,
+        score_threshold=FLAGS.score
+    )
+
+    # convert data to numpy arrays and slice out unused elements
+    num_objects = valid_detections.numpy()[0]
+    bboxes = boxes.numpy()[0]
+    bboxes = bboxes[0:int(num_objects)]
+    scores = scores.numpy()[0]
+    scores = scores[0:int(num_objects)]
+    classes = classes.numpy()[0]
+    classes = classes[0:int(num_objects)]
+
+    # format bounding boxes from normalized ymin, xmin, ymax, xmax ---> xmin, ymin, width, height
+    original_h, original_w, _ = frame.shape
+    bboxes = utils.format_boxes(bboxes, original_h, original_w)
+
+    # store all predictions in one parameter for simplicity when calling functions
+    pred_bbox = [bboxes, scores, classes, num_objects]
+
+    # read in all class names from config
+    class_names = utils.read_class_names(cfg.YOLO.CLASSES)
+
+    # by default allow all classes in .names file
+    allowed_classes = list(class_names.values())
+    
+    # custom allowed classes (uncomment line below to customize tracker for only people)
+    allowed_classes = ['car', 'motorbike', 'truck', 'bus']
+
+    # loop through objects and use class index to get class name, allow only classes in allowed_classes list
+    names = []
+    deleted_indx = []
+    for i in range(num_objects):
+        class_indx = int(classes[i])
+        class_name = class_names[class_indx]
+        if class_name not in allowed_classes:
+            deleted_indx.append(i)
+        else:
+            names.append(class_name)
+    names = np.array(names)
+    count = len(names)
+    if FLAGS.count:
+            # count objects found
+        counted_classes = count_objects(pred_bbox, by_class = True, allowed_classes=allowed_classes)
+        x, y = 5, 35
+        #offset = 0
+        # loop through dict and print
+        #for key, value in counted_classes.items():
+        #   print("Number of {}s: {}".format(key, value))
+        #    cv2.putText(frame, "{}s being tracked: {}".format(key, value), (x, y + offset), cv2.FONT_HERSHEY_COMPLEX_SMALL, 2, (0, 255, 0), 2) 
+        #    offset += 50                                            
+        cv2.putText(frame, "vehicles being tracked: {}".format(count), (x, y), cv2.FONT_HERSHEY_COMPLEX_SMALL, 2, (0, 255, 0), 2)
+        print("vehicles being tracked: {}".format(count))      
+    # delete detections that are not in allowed_classes
+    bboxes = np.delete(bboxes, deleted_indx, axis=0)
+    scores = np.delete(scores, deleted_indx, axis=0)
+
+    # encode yolo detections and feed to tracker
+    features = encoder(frame, bboxes)
+    detections = [Detection(bbox, score, class_name, feature) for bbox, score, class_name, feature in zip(bboxes, scores, names, features)]
+
+    #initialize color map
+    cmap = plt.get_cmap('tab20b')
+    colors = [cmap(i)[:3] for i in np.linspace(0, 1, 20)]
+
+    # run non-maxima supression
+    boxs = np.array([d.tlwh for d in detections])
+    scores = np.array([d.confidence for d in detections])
+    classes = np.array([d.class_name for d in detections])
+    indices = preprocessing.non_max_suppression(boxs, classes, nms_max_overlap, scores)
+    detections = [detections[i] for i in indices]       
+
+    # Call the tracker
+    tracker.predict()
+    tracker.update(detections)
+
+    previous_tracker = copy.deepcopy(tracker)
+    
+
+    total_stationary_percentage = 0
+    moving = 0
+    not_moving = 0
+    congestion = 0
+    congestion_status = ""
+
     # while video is running
     while True:
         return_value, frame = vid.read()
@@ -99,7 +244,7 @@ def main(_argv):
             image = Image.fromarray(frame)
         else:
             print('Video has ended or failed, try a different video format!')
-            break
+            break         
         frame_num +=1
         print('Frame #: ', frame_num)
         frame_size = frame.shape[:2]
@@ -160,7 +305,7 @@ def main(_argv):
         allowed_classes = list(class_names.values())
         
         # custom allowed classes (uncomment line below to customize tracker for only people)
-        #allowed_classes = ['person']
+        allowed_classes = ['car', 'motorbike', 'truck', 'bus']
 
         # loop through objects and use class index to get class name, allow only classes in allowed_classes list
         names = []
@@ -175,8 +320,18 @@ def main(_argv):
         names = np.array(names)
         count = len(names)
         if FLAGS.count:
-            cv2.putText(frame, "Objects being tracked: {}".format(count), (5, 35), cv2.FONT_HERSHEY_COMPLEX_SMALL, 2, (0, 255, 0), 2)
-            print("Objects being tracked: {}".format(count))
+             # count objects found
+            counted_classes = count_objects(pred_bbox, by_class = True, allowed_classes=allowed_classes)
+            x, y = 5, 35
+            offset = 50
+            #cv2.rectangle(frame, (5, 10), (x + 900, y + 100), (0,0,0), -1)
+            cv2.putText(frame, "Road Congestion: {}".format(congestion_status), (x, y + offset), cv2.FONT_HERSHEY_COMPLEX_SMALL, 2, (255, 0, 0), 2)
+            # loop through dict and print
+            #for key, value in counted_classes.items():
+            #   print("Number of {}s: {}".format(key, value))                 
+            #   offset += 50                                            
+            cv2.putText(frame, "vehicles being tracked: {}".format(count), (x, y), cv2.FONT_HERSHEY_COMPLEX_SMALL, 2, (0, 255, 0), 2)
+            print("vehicles being tracked: {}".format(count))      
         # delete detections that are not in allowed_classes
         bboxes = np.delete(bboxes, deleted_indx, axis=0)
         scores = np.delete(scores, deleted_indx, axis=0)
@@ -201,28 +356,83 @@ def main(_argv):
         tracker.update(detections)
 
         # update tracks
+        itr = 0
         for track in tracker.tracks:
             if not track.is_confirmed() or track.time_since_update > 1:
-                continue 
+                continue
+             
             bbox = track.to_tlbr()
-            class_name = track.get_class()
             
-        # draw bbox on screen
+            class_name = track.get_class()                 
+            
+            # check if vehicles are moving
+            current_moving = False
+
+            previous_track = get_previous_track(previous_tracker, track.track_id)             
+            
+            if previous_track: 
+                previous_bbox = previous_track.to_tlbr()
+                 # if enable info flag then print details about each track
+            if FLAGS.info:
+                print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}, moving: {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])), current_moving))
+
+                print("Tracker ID: {}, Previous Coordinates: {}".format(previous_track.track_id, (int(previous_bbox[0]),int(previous_bbox[1]), int(previous_bbox[2]), int(previous_bbox[3]))))
+
+                if (is_moving(bbox, previous_bbox)): 
+                    current_moving = True
+                    moving += 1
+                else:
+                    not_moving += 1
+                
+
+            # if enable info flag then print details about each track
+            #if FLAGS.info:
+                print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}, moving: {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])), current_moving))
+                #print("Tracker ID: {}, Previous Coordinates: {}".format(previous_track.track_id, (int(previous_bbox[0]),int(previous_bbox[1]), int(previous_bbox[2]), int(previous_bbox[3]))))
+            
+            
+            
+            
+            
+            # draw bbox on screen
             color = colors[int(track.track_id) % len(colors)]
             color = [i * 255 for i in color]
             cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
             cv2.rectangle(frame, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
-            cv2.putText(frame, class_name + "-" + str(track.track_id),(int(bbox[0]), int(bbox[1]-10)),0, 0.75, (255,255,255),2)
+            cv2.putText(frame, class_name + "-" + str(track.track_id) + " movement: " + str(current_moving),(int(bbox[0]), int(bbox[1]-10)),0, 0.75, (255,255,255),2)
 
-        # if enable info flag then print details about each track
-            if FLAGS.info:
-                print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
+            itr += 1
+
+
+        if frame_num % 2 == 0: previous_tracker = copy.deepcopy(tracker)
+        
+        if moving != 0 or not_moving != 0:
+            total_stationary_percentage = 100 * not_moving / (moving + not_moving)
+
+        ## Proportion of moving cars
+        if moving: print("Moving: {}, not moving: {}, percentage: {}%".format(moving, not_moving, total_stationary_percentage))
+                
+        moving = 0
+        not_moving = 0
+
+        #check for congestion:
+        if total_stationary_percentage > 50:
+            congestion += 1
+        if count > 10:
+            congestion += 1
+        
+        if congestion == 0: congestion_status = "Not detected"
+        elif congestion == 1: congestion_status = "Light congestion"
+        elif congestion == 2: congestion_status = "Congested"
+
+        congestion = 0
 
         # calculate frames per second of running detections
         fps = 1.0 / (time.time() - start_time)
         print("FPS: %.2f" % fps)
         result = np.asarray(frame)
         result = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
         
         if not FLAGS.dont_show:
             cv2.imshow("Output Video", result)
