@@ -40,7 +40,7 @@ flags.DEFINE_boolean('dont_show', False, 'dont show video output')
 flags.DEFINE_boolean('info', True, 'show detailed info of tracked objects')
 flags.DEFINE_boolean('count', True, 'count objects being tracked on screen')
 
-movement_threshold = 1
+movement_threshold = 2
 
 def is_moving(bbox, previus_bbox):
     return (
@@ -330,7 +330,7 @@ def main(_argv):
             #for key, value in counted_classes.items():
             #   print("Number of {}s: {}".format(key, value))                 
             #   offset += 50                                            
-            cv2.putText(frame, "vehicles being tracked: {}".format(count), (x, y), cv2.FONT_HERSHEY_COMPLEX_SMALL, 2, (0, 255, 0), 2)
+            cv2.putText(frame, "vehicles being tracked: {}".format(count), (x, y), cv2.FONT_HERSHEY_COMPLEX_SMALL, 2, (255, 0, 0), 2)
             print("vehicles being tracked: {}".format(count))      
         # delete detections that are not in allowed_classes
         bboxes = np.delete(bboxes, deleted_indx, axis=0)
@@ -362,49 +362,51 @@ def main(_argv):
                 continue
              
             bbox = track.to_tlbr()
-            
+            bboxSize = track.to_xyah()
+            bboxHeight = bboxSize[3]
             class_name = track.get_class()                 
             
             # check if vehicles are moving
             current_moving = False
 
+            if bboxHeight > 50:
+                frameCheck = True
+            elif bboxHeight <= 50:
+                frameCheck = False  
+            
             previous_track = get_previous_track(previous_tracker, track.track_id)             
             
-            if previous_track: 
-                previous_bbox = previous_track.to_tlbr()
+            if previous_track:
+                if frameCheck: previous_bbox = previous_track.to_tlbr()
+
+
+            if (is_moving(bbox, previous_bbox)): 
+                current_moving = True
+                moving += 1
+            else:
+                not_moving += 1
                  # if enable info flag then print details about each track
             if FLAGS.info:
                 print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}, moving: {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])), current_moving))
 
                 print("Tracker ID: {}, Previous Coordinates: {}".format(previous_track.track_id, (int(previous_bbox[0]),int(previous_bbox[1]), int(previous_bbox[2]), int(previous_bbox[3]))))
 
-                if (is_moving(bbox, previous_bbox)): 
-                    current_moving = True
-                    moving += 1
-                else:
-                    not_moving += 1
-                
-
-            # if enable info flag then print details about each track
-            #if FLAGS.info:
-                print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}, moving: {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])), current_moving))
-                #print("Tracker ID: {}, Previous Coordinates: {}".format(previous_track.track_id, (int(previous_bbox[0]),int(previous_bbox[1]), int(previous_bbox[2]), int(previous_bbox[3]))))
-            
-            
-            
-            
+                print("bbox height: {}".format(bboxHeight))
             
             # draw bbox on screen
-            color = colors[int(track.track_id) % len(colors)]
-            color = [i * 255 for i in color]
-            cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
-            cv2.rectangle(frame, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
-            cv2.putText(frame, class_name + "-" + str(track.track_id) + " movement: " + str(current_moving),(int(bbox[0]), int(bbox[1]-10)),0, 0.75, (255,255,255),2)
+            #color = colors[int(track.track_id) % len(colors)]
+            #color = [i * 255 for i in color]
+            #cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
+            #cv2.rectangle(frame, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
+            #cv2.putText(frame, class_name + "-" + str(track.track_id) + " movement: " + str(current_moving),(int(bbox[0]), int(bbox[1]-10)),0, 0.75, (255,255,255),2)
 
             itr += 1
+        
+        
+        previous_tracker = copy.deepcopy(tracker)
+        
 
-
-        if frame_num % 2 == 0: previous_tracker = copy.deepcopy(tracker)
+        
         
         if moving != 0 or not_moving != 0:
             total_stationary_percentage = 100 * not_moving / (moving + not_moving)
@@ -416,9 +418,9 @@ def main(_argv):
         not_moving = 0
 
         #check for congestion:
-        if total_stationary_percentage > 50:
+        if total_stationary_percentage >= 40:
             congestion += 1
-        if count > 10:
+        if count > 15:
             congestion += 1
         
         if congestion == 0: congestion_status = "Not detected"
