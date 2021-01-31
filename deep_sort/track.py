@@ -109,7 +109,18 @@ class Track:
         ret = self.to_tlwh()
         ret[2:] = ret[:2] + ret[2:]
         return ret
+
     
+        
+    def to_xyah(self):
+        """Convert bounding box to format `(center x, center y, aspect ratio,
+            height)`, where the aspect ratio is `width / height`.
+        """
+        ret = self.to_tlwh()
+        ret[:2] += ret[2:] / 2
+        ret[2] /= ret[3]
+        return ret
+
     def get_class(self):
         return self.class_name
 
